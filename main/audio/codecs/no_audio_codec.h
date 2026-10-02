@@ -29,6 +29,16 @@ class NoAudioCodecSimplex : public NoAudioCodec {
 public:
     NoAudioCodecSimplex(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, gpio_num_t mic_sck, gpio_num_t mic_ws, gpio_num_t mic_din);
     NoAudioCodecSimplex(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, i2s_std_slot_mask_t spk_slot_mask, gpio_num_t mic_sck, gpio_num_t mic_ws, gpio_num_t mic_din, i2s_std_slot_mask_t mic_slot_mask);
+
+protected:
+    // Software reference buffer for AEC (when input_reference_ is true)
+    int Read(int16_t* dest, int samples) override;
+    int Write(const int16_t* data, int samples) override;
+
+private:
+    std::vector<int16_t> ref_buffer_;
+    size_t read_pos_ = 0;
+    size_t write_pos_ = 0;
 };
 
 class NoAudioCodecSimplexPdm : public NoAudioCodec {

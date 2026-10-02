@@ -149,6 +149,13 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
 
+#ifdef CONFIG_USE_DEVICE_AEC
+    // Enable software reference for AEC
+    input_reference_ = true;
+    input_channels_ = 2; // 1 mic + 1 reference
+    ref_buffer_.resize(4800); // 300ms at 16kHz - enough for DMA latency + acoustic path delay
+#endif
+
     // Create a new channel for speaker
     i2s_chan_config_t chan_cfg = {
         .id = (i2s_port_t)0,
@@ -211,7 +218,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.din = mic_din;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
-    ESP_LOGI(TAG, "Simplex channels created");
+    ESP_LOGI(TAG, "Simplex channels created with AEC reference");
 }
 
 int NoAudioCodec::Write(const int16_t* data, int samples) {
@@ -235,6 +242,77 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
     size_t bytes_written;
     ESP_ERROR_CHECK(i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY));
     return bytes_written / sizeof(int32_t);
+}
+
+// NoAudioCodecSimplex: Read with software AEC reference interleaved
+int NoAudioCodecSimplex::Read(int16_t* dest, int samples) {
+    if (!input_reference_) {
+        // No AEC reference, use base class
+        return NoAudioCodec::Read(dest, samples);
+    }
+
+    // samples = total interleaved samples (mic + ref)
+    // Each pair: [mic_sample, ref_sample]
+    int mic_samples = samples / input_channels_; // number of mono mic samples
+    std::vector<int16_t> mic_data(mic_samples);
+
+    // Read mic data using base class Read (which reads 32-bit I2S and converts to 16-bit)
+    size_t bytes_read;
+    std::vector<int32_t> bit32_buffer(mic_samples);
+    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), mic_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
+        return 0;
+    }
+    int actual_samples = bytes_read / sizeof(int32_t);
+    for (int i = 0; i < actual_samples; i++) {
+        int32_t value = bit32_buffer[i] >> 12;
+        mic_data[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
+    }
+
+    // Interleave: [mic, ref, mic, ref, ...]
+    int i = 0;
+    for (int j = 0; j < actual_samples; j++) {
+        dest[i++] = mic_data[j];  // mic channel
+        dest[i++] = (read_pos_ < write_pos_) ? ref_buffer_[read_pos_++] : 0;  // ref channel
+    }
+
+    if (read_pos_ == write_pos_) {
+        read_pos_ = write_pos_ = 0;
+    }
+
+    return i; // total interleaved samples written
+}
+
+// NoAudioCodecSimplex: Write with software AEC reference caching
+int NoAudioCodecSimplex::Write(const int16_t* data, int samples) {
+    // Call base class to actually write to speaker (applies volume scaling)
+    int written = NoAudioCodec::Write(data, samples);
+
+    if (input_reference_ && written > 0) {
+        // Cache the VOLUME-SCALED audio as reference for AEC
+        // Must match what the speaker actually outputs
+        int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+        
+        if (write_pos_ - read_pos_ + written > ref_buffer_.size()) {
+            assert(ref_buffer_.size() >= (size_t)written);
+            // Overflow: keep only the most recent data
+            read_pos_ = write_pos_ + written - ref_buffer_.size();
+        }
+        if (read_pos_) {
+            if (write_pos_ != read_pos_) {
+                memmove(ref_buffer_.data(), ref_buffer_.data() + read_pos_, (write_pos_ - read_pos_) * sizeof(int16_t));
+            }
+            write_pos_ -= read_pos_;
+            read_pos_ = 0;
+        }
+        // Apply same volume scaling as NoAudioCodec::Write() but keep as 16-bit
+        for (int i = 0; i < written; i++) {
+            int32_t scaled = (int32_t(data[i]) * volume_factor) >> 16;
+            ref_buffer_[write_pos_ + i] = (scaled > INT16_MAX) ? INT16_MAX : (scaled < -INT16_MAX) ? -INT16_MAX : (int16_t)scaled;
+        }
+        write_pos_ += written;
+    }
+
+    return written;
 }
 
 int NoAudioCodec::Read(int16_t* dest, int samples) {

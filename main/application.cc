@@ -9,6 +9,14 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "clock_sync.h"
+#include "alarm_service.h"
+#ifdef CONFIG_USE_AVAGENC_DEVICE_BINDING
+#include "device_binding.h"
+#endif
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+#include "user_pairing.h"
+#endif
 
 #include <cstring>
 #include <esp_log.h>
@@ -62,11 +70,32 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    // Apply timezone before anything renders wall-clock time
+    ClockSync::GetInstance().ApplyTimezone();
+    // Restore persisted alarms and start the wall-clock checker
+    AlarmService::GetInstance().Start();
+
     // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
     // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
+
+    // Apply the assets partition NOW, before the network comes up: the boot /
+    // wifi-connecting screen shows the animated wifi.gif from the emoji
+    // collection, so the collection must already be swapped in. (This replaces
+    // the old call site in ActivationTask, which ran too late for boot UI.)
+    {
+        auto& assets = Assets::GetInstance();
+        if (assets.partition_valid()) {
+            ESP_LOGI(TAG, "Applying local assets partition (emoji collection, fonts)");
+            assets.Apply();
+        } else {
+            ESP_LOGW(TAG, "Assets partition not valid; falling back to built-in emoji");
+        }
+    }
+    // Boot visual: animated wifi icon while the device brings up WiFi.
+    display->SetEmotion("wifi");
 
     // Setup the audio service
     auto codec = board.GetAudioCodec();
@@ -218,7 +247,13 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+            // When speaker is actively playing, discard mic audio to prevent echo
+            // from reaching the server (ElevenLabs would interpret it as user speech)
+            bool suppress = audio_service_.IsPlaybackActive();
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                if (suppress) {
+                    continue; // Discard mic audio during playback
+                }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
@@ -275,7 +310,7 @@ void Application::HandleNetworkConnectedEvent() {
             app->ActivationTask();
             app->activation_task_handle_ = nullptr;
             vTaskDelete(NULL);
-        }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        }, "activation", 4096 * 3, this, 2, &activation_task_handle_);
     }
 
     // Update the status bar immediately to show the network state
@@ -321,16 +356,43 @@ void Application::HandleActivationDoneEvent() {
 }
 
 void Application::ActivationTask() {
-    // Create OTA object for activation process
+    // Create OTA object (needed by some init paths, but we skip cloud checks)
     ota_ = std::make_unique<Ota>();
 
-    // Check for new assets version
-    CheckAssetsVersion();
+    // BYPASSED: CheckAssetsVersion() and CheckNewVersion()
+    // These connect to Xiaozhi cloud (mqtt.xiaozhi.me) for OTA/activation.
+    // We don't need them — our server is the Go bridge at ws://16.176.46.21:8081/ws
+    ESP_LOGI(TAG, "Skipping Xiaozhi cloud OTA/activation — using custom Go bridge server");
+    // Note: assets.Apply() now runs early in Initialize() so the boot screen can
+    // use the wifi.gif emotion from the assets partition.
 
-    // Check for new firmware version
-    CheckNewVersion();
+#ifdef CONFIG_USE_AVAGENC_DEVICE_BINDING
+    // Pair this device to an avagenc user account before going online. If already
+    // bound this returns immediately; otherwise it shows a QR + code and blocks
+    // until the user binds it (or the backend is unreachable for too long).
+    {
+        DeviceBinding binding;
+        if (!binding.IsBound()) {
+            ESP_LOGI(TAG, "Device not bound yet, starting avagenc pairing flow");
+            binding.EnsureBound();
+        }
+    }
+#endif
 
-    // Initialize the protocol
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+    // Local (LAN) pairing: if no user is stored, host a small HTTP server and
+    // show a QR so the avagenc app can post the user_id straight to the device.
+    // Blocks until paired. No backend/DB — the user_id lives in NVS for now.
+    {
+        UserPairing pairing;
+        if (!pairing.HasUser()) {
+            ESP_LOGI(TAG, "No user paired yet, starting avagenc local pairing flow");
+            pairing.EnsurePaired();
+        }
+    }
+#endif
+
+    // Initialize the protocol (forced to WebSocket)
     InitializeProtocol();
 
     // Signal completion to main loop
@@ -477,14 +539,9 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
-    } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
-    }
+    // Force WebSocket protocol — connect to Go bridge server, not Xiaozhi cloud MQTT
+    ESP_LOGI(TAG, "Using WebSocket protocol (Go bridge server)");
+    protocol_ = std::make_unique<WebsocketProtocol>();
 
     protocol_->OnConnected([this]() {
         DismissAlert();
@@ -496,7 +553,10 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        auto state = GetDeviceState();
+        // Go bridge server sends audio directly without TTS start/stop messages.
+        // Accept audio in both listening and speaking states.
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -560,6 +620,14 @@ void Application::InitializeProtocol() {
             if (cJSON_IsString(emotion)) {
                 Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
                     display->SetEmotion(emotion_str.c_str());
+                });
+            }
+            // Display the AI's response text on the LCD
+            auto text = cJSON_GetObjectItem(root, "text");
+            if (cJSON_IsString(text)) {
+                ESP_LOGI(TAG, "<< %s", text->valuestring);
+                Schedule([display, message = std::string(text->valuestring)]() {
+                    display->SetChatMessage("assistant", message.c_str());
                 });
             }
         } else if (strcmp(type->valuestring, "mcp") == 0) {
@@ -798,6 +866,15 @@ void Application::HandleWakeWordDetectedEvent() {
         // Channel already opened, continue directly
         ContinueWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        // Ignore wake word while the speaker is playing: with no AEC the mic hears
+        // our own TTS voice and the wake word engine false-triggers on it. Acting on
+        // that trigger aborts the session mid-welcome and (worse) used to re-enable
+        // wake word in listening state, starving the audio processor of mic data —
+        // the device went permanently deaf to the server.
+        if (audio_service_.IsPlaybackActive()) {
+            ESP_LOGW(TAG, "Wake word during playback (own TTS echo) — ignored");
+            return;
+        }
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue());
@@ -806,8 +883,12 @@ void Application::HandleWakeWordDetectedEvent() {
             protocol_->SendStartListening(GetDefaultListeningMode());
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
-            // Re-enable wake word detection as it was stopped by the detection itself
-            audio_service_.EnableWakeWordDetection(true);
+            // Keep mic routed to the audio processor: in AudioInputTask the wake
+            // word engine has PRIORITY over the processor, so turning wake word
+            // back on here while staying in listening state starves the processor
+            // (no mic audio ever reaches the server). Mirror the listening-state
+            // policy from HandleStateChangedEvent instead: AFE wake word only.
+            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
         } else {
             // Play popup sound and start listening again
             play_popup_on_listening_ = true;
@@ -860,7 +941,8 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
-    
+    display->OnStateChanged(new_state);
+
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:

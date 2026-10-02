@@ -356,6 +356,9 @@ bool Assets::LvglStrategy::Apply(Assets* assets) {
 }
 #endif // HAVE_LVGL
 
+#if !HAVE_LVGL
+// EmoteStrategy pulls in esp_emote_gfx, whose bundled qrcodegen collides with
+// LVGL's qrcodegen at link time — only compile it for the emote display path.
 bool Assets::EmoteStrategy::InitializePartition(Assets* assets) {
     assets->partition_valid_ = false;
 
@@ -422,6 +425,7 @@ bool Assets::EmoteStrategy::Apply(Assets* assets) {
     }
     return true;
 }
+#endif // !HAVE_LVGL
 
 bool Assets::Download(std::string url, std::function<void(int progress, size_t speed)> progress_callback) {
     ESP_LOGI(TAG, "Downloading new version of assets from %s", url.c_str());

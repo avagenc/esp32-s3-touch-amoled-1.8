@@ -17,6 +17,9 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "alarm_service.h"
+#include "weather_service.h"
+#include "clock_sync.h"
 
 #define TAG "MCP"
 
@@ -96,6 +99,98 @@ void McpServer::AddCommonTools() {
                 return false;
             });
     }
+
+    // ---- Timer & alarm (voice: "set timer 5 menit", "alarm jam 6 pagi") ----
+    AddTool("self.timer.set",
+        "Start a countdown timer. When it finishes the device rings and shows an alert. "
+        "Only one timer runs at a time; setting a new one replaces it.",
+        PropertyList({
+            Property("seconds", kPropertyTypeInteger, 1, 86400)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            return AlarmService::GetInstance().SetTimer(properties["seconds"].value<int>());
+        });
+
+    AddTool("self.timer.cancel",
+        "Cancel the running countdown timer.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            return std::string(AlarmService::GetInstance().CancelTimer()
+                ? "Timer dibatalkan" : "Tidak ada timer yang berjalan");
+        });
+
+    AddTool("self.alarm.ring",
+        "Ring the device now (alert screen + repeated sound). Alarm schedules live in the "
+        "backend database; call this when a scheduled alarm fires. `title` is shown on screen.",
+        PropertyList({
+            Property("title", kPropertyTypeString, std::string("Alarm"))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            AlarmService::GetInstance().RingNow(properties["title"].value<std::string>());
+            return true;
+        });
+
+    // ---- Ambient watch face, night mode, weather, timezone ----
+    AddTool("self.ambient.set_face",
+        "Set the idle (ambient) watch face: 0=digital, 1=analog, 2=wallpaper, 3=emoji.",
+        PropertyList({
+            Property("face", kPropertyTypeInteger, 0, 3)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            Settings settings("display", true);
+            settings.SetInt("ambient_face", properties["face"].value<int>());
+            return std::string("Watch face diganti (berlaku saat ambient berikutnya)");
+        });
+
+    AddTool("self.night_mode.set",
+        "Configure night mode (extra dim ambient screen during quiet hours).",
+        PropertyList({
+            Property("enabled", kPropertyTypeBoolean, true),
+            Property("start_hour", kPropertyTypeInteger, 22, 0, 23),
+            Property("end_hour", kPropertyTypeInteger, 6, 0, 23)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            Settings settings("night", true);
+            settings.SetBool("enabled", properties["enabled"].value<bool>());
+            settings.SetInt("start", properties["start_hour"].value<int>());
+            settings.SetInt("end", properties["end_hour"].value<int>());
+            return true;
+        });
+
+    AddTool("self.weather.get",
+        "Get the current weather at the device's configured location.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto& weather = WeatherService::GetInstance();
+            auto reading = weather.GetLastReading();
+            if (reading.empty()) {
+                return std::string("Data cuaca belum tersedia");
+            }
+            auto city = weather.GetLocationCity();
+            return city.empty() ? reading : city + ": " + reading;
+        });
+
+    AddTool("self.weather.set_location",
+        "Set the weather location by city name (city-level only; the canonical location is "
+        "stored in the backend database). The device geocodes the city and caches it.",
+        PropertyList({
+            Property("city", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            return WeatherService::GetInstance().SetLocationCity(
+                properties["city"].value<std::string>());
+        });
+
+    AddTool("self.clock.set_timezone",
+        "Set the clock timezone as hours east of UTC (7=WIB, 8=WITA, 9=WIT).",
+        PropertyList({
+            Property("utc_offset", kPropertyTypeInteger, -12, 14)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            ClockSync::GetInstance().SetTimezoneOffsetHours(
+                properties["utc_offset"].value<int>());
+            return true;
+        });
 
     auto camera = board.GetCamera();
     if (camera) {

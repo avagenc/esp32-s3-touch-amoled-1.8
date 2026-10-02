@@ -31,4 +31,9 @@ public:
     Twemoji64();
 };
 
+class Twemoji128 : public EmojiCollection {
+public:
+    Twemoji128();
+};
+
 #endif

@@ -51,9 +51,19 @@ CONFIG_LV_USE_ASSERT_STYLE=y
 
 # Use compressed font
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
+# Fonts for the ambient watch face (big clock digits + date)
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_USE_FONT_COMPRESSED=n
 CONFIG_LV_USE_FONT_PLACEHOLDER=n
 CONFIG_LV_USE_LODEPNG=y
+
+# QR code library (device <-> user account pairing screen)
+CONFIG_LV_USE_QRCODE=y
+
+# avagenc local user pairing (LAN QR, device-hosted HTTP server, no backend)
+CONFIG_USE_AVAGENC_USER_PAIRING=y
+CONFIG_AVAGENC_PAIRING_PORT=8080
 
 # Disable extra widgets to save flash size
 CONFIG_LV_USE_ANIMIMG=n
@@ -76,3 +86,4 @@ CONFIG_LV_USE_WIN=n
 CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
 
+CONFIG_AMBIENT_MODE_TIMEOUT_SEC=30

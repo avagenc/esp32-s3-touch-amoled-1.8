@@ -15,6 +15,7 @@ set(SOURCES "audio/audio_codec.cc"
             "led/gpio_led.cc"
             "display/display.cc"
             "display/lcd_display.cc"
+            "display/ambient_screen.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
             "display/emote_display.cc"
@@ -34,6 +35,9 @@ set(SOURCES "audio/audio_codec.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
+            "clock_sync.cc"
+            "weather_service.cc"
+            "alarm_service.cc"
             "device_state_machine.cc"
             "assets.cc"
             "main.cc"
@@ -315,7 +319,15 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C)
     set(BOARD_TYPE "esp32-s3-touch-lcd-1.85c")
     set(BUILTIN_TEXT_FONT font_puhui_basic_16_4)
     set(BUILTIN_ICON_FONT font_awesome_16_4)
-    set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    # avagenc: animated emoji. Files live in the project-owned, git-tracked folder
+    # main/assets/emoji/avagenc_128/<emotion>.gif (looping, 128x128) — safe from
+    # `idf.py fullclean` and component-manager re-download (unlike managed_components).
+    # Drop your own GIFs over those filenames — same 21 emotion names — and rebuild;
+    # build_default_assets.py packs them into the assets partition.
+    set(DEFAULT_EMOJI_COLLECTION avagenc_128)
+    # avagenc: ambient watch-face wallpaper. Replace wallpaper.png (360x360)
+    # with your own and rebuild.
+    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/wallpapers")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-touch-lcd-1.85")
@@ -719,10 +731,20 @@ if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
 else()
     list(APPEND SOURCES "audio/wake_words/esp_wake_word.cc")
 endif()
+# Edge Impulse wake word (always available as fallback)
+list(APPEND SOURCES "audio/wake_words/ei_wake_word.cc")
 
 # Auto Select Additional Sources
 if (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING)
     list(APPEND SOURCES "boards/common/blufi.cpp")
+endif ()
+# avagenc device <-> user account binding (QR pairing)
+if (CONFIG_USE_AVAGENC_DEVICE_BINDING)
+    list(APPEND SOURCES "device_binding.cc")
+endif ()
+# avagenc local user pairing (LAN QR, device-hosted HTTP server, no backend)
+if (CONFIG_USE_AVAGENC_USER_PAIRING)
+    list(APPEND SOURCES "user_pairing.cc")
 endif ()
 # Select language directory according to Kconfig
 if(CONFIG_LANGUAGE_ZH_CN)
@@ -867,6 +889,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_http_server
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
@@ -880,6 +903,7 @@ idf_component_register(SRCS ${SOURCES}
                         console
                         efuse
                         bt
+                        ei_wake_word
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -987,6 +1011,9 @@ function(build_default_assets_bin)
     
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
+    # Project-owned emoji collections (git-tracked, survive fullclean / component
+    # re-resolution). If <root>/<collection> exists it overrides the managed component.
+    list(APPEND BUILD_ARGS "--project_emoji_root" "${CMAKE_CURRENT_SOURCE_DIR}/assets/emoji")
     
     # Create custom command to build assets
     add_custom_command(

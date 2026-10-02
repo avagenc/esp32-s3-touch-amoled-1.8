@@ -2,6 +2,7 @@
 #define DISPLAY_H
 
 #include "emoji_collection.h"
+#include "device_state.h"
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
 #define HAVE_LVGL 1
@@ -40,9 +41,21 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
-    virtual void SetupUI() { 
+    virtual void SetupUI() {
         setup_ui_called_ = true;
     }
+
+    // Full-screen pairing overlay: QR code + short fallback code + caption.
+    // Default no-op so non-LVGL displays simply ignore it.
+    virtual void ShowQrCode(const std::string& qr_data, const std::string& code, const std::string& caption) {}
+    virtual void HideQrCode() {}
+
+    // Called by Application whenever the device state changes; lets displays
+    // drive state-dependent UI (ambient screen, state animations).
+    virtual void OnStateChanged(DeviceState state) {}
+
+    // Current weather for the ambient watch face (icon glyph + "26° Cerah").
+    virtual void SetWeather(const char* icon_utf8, const char* text) {}
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

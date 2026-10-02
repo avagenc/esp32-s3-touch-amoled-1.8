@@ -710,7 +710,7 @@ config USE_DEVICE_AEC
         || BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_3_4C || BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_4C || BOARD_TYPE_ESP_S3_LCD_EV_Board_2 || BOARD_TYPE_YUNLIAO_S3 \
         || BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_7 || BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_8 || BOARD_TYPE_WAVESHARE_ESP32_P4_WIFI6_TOUCH_LCD_10_1 \
         || BOARD_TYPE_ECHOEAR || BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_49 || BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2 || BOARD_TYPE_ZHENGCHEN_CAM || BOARD_TYPE_ZHENGCHEN_CAM_ML307 \
-        || BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_4_3C)
+        || BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_4_3C || BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C)
     help
         To work properly, device-side AEC requires a clean output reference path from the speaker signal and physical acoustic isolation between the microphone and speaker.
 
@@ -762,6 +762,92 @@ config RECEIVE_CUSTOM_MESSAGE
     default n
     help
         Enable custom message reception, allow the device to receive custom messages from the server (preferably through the MQTT protocol)
+
+config USE_AVAGENC_DEVICE_BINDING
+    bool "Enable avagenc device<->user binding (QR pairing)"
+    default n
+    help
+        On boot, if the device has no stored binding token, show a QR code plus a
+        short fallback code on the LCD and pair the device to an avagenc user
+        account via the avagenc backend REST API. The device then sends its
+        opaque binding token as a Bearer token; the backend resolves the user_id.
+
+config AVAGENC_API_BASE_URL
+    string "avagenc backend base URL"
+    default "https://api.avagenc.com"
+    depends on USE_AVAGENC_DEVICE_BINDING
+    help
+        Base URL of the avagenc backend. Endpoints used:
+        POST <base>/api/v1/devices/pair/start and
+        GET  <base>/api/v1/devices/{device_id}/status
+        Can be overridden at runtime via NVS ("avagenc"/"api_url").
+
+config USE_AVAGENC_USER_PAIRING
+    bool "Enable avagenc local user pairing (LAN QR, no backend)"
+    default y
+    help
+        On boot, if no user_id is stored, the device starts a small HTTP server
+        on the WiFi LAN and shows a QR encoding its IP/port plus a one-time code.
+        The avagenc mobile app (same WiFi, logged-in user) scans it and POSTs the
+        user_id to the device, which stores it in NVS. No backend/DB is involved;
+        at runtime the stored user_id is sent to the bridge as X-User-Id.
+        See pairing.md for the mobile-app contract.
+
+config AVAGENC_PAIRING_PORT
+    int "avagenc local pairing HTTP port"
+    default 8080
+    depends on USE_AVAGENC_USER_PAIRING
+    help
+        TCP port the device listens on during local pairing. Must match the port
+        the mobile app posts to (also advertised in the QR payload).
+
+config CLOCK_TIMEZONE_OFFSET
+    int "Default timezone offset in hours east of UTC"
+    default 7
+    range -12 14
+    help
+        Timezone used to render the clock (7 = WIB, 8 = WITA, 9 = WIT).
+        Can be overridden at runtime via NVS ("clock"/"tz_offset").
+        The system clock itself stays in UTC (synced via SNTP).
+
+config AMBIENT_MODE_ENABLE
+    bool "Enable ambient (watch face) mode when idle"
+    default y
+    help
+        After the device has been idle for a while, dim the backlight and
+        show a full-screen clock instead of the assistant UI. Touching the
+        screen or saying the wake word returns to the normal UI.
+
+config AMBIENT_MODE_TIMEOUT_SEC
+    int "Seconds of idle before ambient mode starts"
+    default 30
+    range 5 3600
+    depends on AMBIENT_MODE_ENABLE
+    help
+        Can be overridden at runtime via NVS ("display"/"ambient_sec").
+
+config WEATHER_ENABLE
+    bool "Show current weather (Open-Meteo, no API key)"
+    default y
+    help
+        Fetch the current temperature and conditions from open-meteo.com
+        every 30 minutes and show them on the ambient watch face.
+
+config WEATHER_LATITUDE
+    string "Weather location latitude"
+    default "-6.2000"
+    depends on WEATHER_ENABLE
+    help
+        Decimal degrees (default Jakarta). Override at runtime via NVS
+        ("weather"/"lat").
+
+config WEATHER_LONGITUDE
+    string "Weather location longitude"
+    default "106.8167"
+    depends on WEATHER_ENABLE
+    help
+        Decimal degrees (default Jakarta). Override at runtime via NVS
+        ("weather"/"lon").
 
 menu "Camera Configuration"
     depends on !IDF_TARGET_ESP32

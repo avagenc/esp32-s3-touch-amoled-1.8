@@ -15,6 +15,16 @@
 #include <src/misc/cache/lv_cache.h>
 
 #include "board.h"
+#include "audio_codec.h"
+
+#include <wifi_manager.h>
+#include <esp_system.h>
+#ifdef CONFIG_USE_AVAGENC_DEVICE_BINDING
+#include "device_binding.h"
+#endif
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+#include "user_pairing.h"
+#endif
 
 #define TAG "LcdDisplay"
 
@@ -26,6 +36,9 @@ void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
     auto icon_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
     auto large_icon_font = std::make_shared<LvglBuiltInFont>(&font_awesome_30_4);
+
+    // Initialize twemoji_64 emoji collection for both themes
+    auto emoji_collection = std::make_shared<Twemoji128>();
 
     // light theme
     auto light_theme = new LvglTheme("light");
@@ -41,6 +54,7 @@ void LcdDisplay::InitializeLcdThemes() {
     light_theme->set_text_font(text_font);
     light_theme->set_icon_font(icon_font);
     light_theme->set_large_icon_font(large_icon_font);
+    light_theme->set_emoji_collection(emoji_collection);
 
     // dark theme
     auto dark_theme = new LvglTheme("dark");
@@ -56,6 +70,7 @@ void LcdDisplay::InitializeLcdThemes() {
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
+    dark_theme->set_emoji_collection(emoji_collection);
 
     auto& theme_manager = LvglThemeManager::GetInstance();
     theme_manager.RegisterTheme("light", light_theme);
@@ -72,7 +87,7 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
 
     // Load theme from settings
     Settings settings("display", false);
-    std::string theme_name = settings.GetString("theme", "light");
+    std::string theme_name = settings.GetString("theme", "dark");
     current_theme_ = LvglThemeManager::GetInstance().GetTheme(theme_name);
 
     // Create a timer to hide the preview image
@@ -87,6 +102,23 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
         .skip_unhandled_events = false,
     };
     esp_timer_create(&preview_timer_args, &preview_timer_);
+
+    // Ambient ("watch face") idle timer
+#if CONFIG_AMBIENT_MODE_ENABLE
+    ambient_timeout_ms_ = settings.GetInt("ambient_sec", CONFIG_AMBIENT_MODE_TIMEOUT_SEC) * 1000;
+#endif
+    if (ambient_timeout_ms_ > 0) {
+        esp_timer_create_args_t ambient_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<LcdDisplay*>(arg)->ShowAmbientScreen();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ambient_timer",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&ambient_timer_args, &ambient_timer_);
+    }
 }
 
 SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -285,17 +317,23 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
-    
+
     // Clean up GIF controller
     if (gif_controller_) {
         gif_controller_->Stop();
         gif_controller_.reset();
     }
-    
+
     if (preview_timer_ != nullptr) {
         esp_timer_stop(preview_timer_);
         esp_timer_delete(preview_timer_);
     }
+
+    if (ambient_timer_ != nullptr) {
+        esp_timer_stop(ambient_timer_);
+        esp_timer_delete(ambient_timer_);
+    }
+    ambient_screen_.reset();
 
     if (preview_image_ != nullptr) {
         lv_obj_del(preview_image_);
@@ -348,6 +386,83 @@ bool LcdDisplay::Lock(int timeout_ms) {
 
 void LcdDisplay::Unlock() {
     lvgl_port_unlock();
+}
+
+void LcdDisplay::ShowQrCode(const std::string& qr_data, const std::string& code, const std::string& caption) {
+    DisplayLockGuard lock(this);
+
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    const lv_font_t* text_font = lvgl_theme ? lvgl_theme->text_font()->font() : nullptr;
+
+    // Recreate from scratch each time so updated codes are reflected.
+    if (qr_overlay_ != nullptr) {
+        lv_obj_del(qr_overlay_);
+        qr_overlay_ = nullptr;
+    }
+
+    lv_obj_t* screen = lv_screen_active();
+    qr_overlay_ = lv_obj_create(screen);
+    lv_obj_remove_style_all(qr_overlay_);
+    lv_obj_set_size(qr_overlay_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_opa(qr_overlay_, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(qr_overlay_, lv_color_hex(0x0B1020), 0);
+    lv_obj_set_style_pad_all(qr_overlay_, 12, 0);
+    lv_obj_set_style_pad_row(qr_overlay_, 10, 0);
+    lv_obj_set_flex_flow(qr_overlay_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(qr_overlay_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollbar_mode(qr_overlay_, LV_SCROLLBAR_MODE_OFF);
+    if (text_font != nullptr) {
+        lv_obj_set_style_text_font(qr_overlay_, text_font, 0);
+    }
+
+    lv_obj_t* title = lv_label_create(qr_overlay_);
+    lv_label_set_text(title, "avagenc");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xA5F3FC), 0);
+
+    if (!caption.empty()) {
+        lv_obj_t* cap = lv_label_create(qr_overlay_);
+        lv_label_set_text(cap, caption.c_str());
+        lv_obj_set_width(cap, LV_HOR_RES * 0.8);
+        lv_label_set_long_mode(cap, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(cap, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(cap, lv_color_hex(0x9AA6C7), 0);
+    }
+
+#if defined(CONFIG_LV_USE_QRCODE)
+    int qr_size = (LV_HOR_RES < LV_VER_RES ? LV_HOR_RES : LV_VER_RES) * 0.55;
+    lv_obj_t* qr = lv_qrcode_create(qr_overlay_);
+    lv_qrcode_set_size(qr, qr_size);
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_qrcode_set_quiet_zone(qr, true);
+    lv_qrcode_update(qr, qr_data.c_str(), qr_data.length());
+    lv_obj_set_style_border_color(qr, lv_color_white(), 0);
+    lv_obj_set_style_border_width(qr, 6, 0);
+    lv_obj_set_style_radius(qr, 6, 0);
+#else
+    // Fallback when the QR library is disabled: show the raw URL as text.
+    lv_obj_t* url = lv_label_create(qr_overlay_);
+    lv_label_set_text(url, qr_data.c_str());
+    lv_obj_set_width(url, LV_HOR_RES * 0.85);
+    lv_label_set_long_mode(url, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(url, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(url, lv_color_white(), 0);
+#endif
+
+    if (!code.empty()) {
+        lv_obj_t* code_label = lv_label_create(qr_overlay_);
+        lv_label_set_text(code_label, code.c_str());
+        lv_obj_set_style_text_color(code_label, lv_color_white(), 0);
+        lv_obj_set_style_text_letter_space(code_label, 3, 0);
+    }
+}
+
+void LcdDisplay::HideQrCode() {
+    DisplayLockGuard lock(this);
+    if (qr_overlay_ != nullptr) {
+        lv_obj_del(qr_overlay_);
+        qr_overlay_ = nullptr;
+    }
 }
 
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
@@ -495,6 +610,28 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+
+    // Create slider overlay for brightness and volume
+    CreateSliderOverlay();
+    InitializeAmbientScreen();
+
+    // Register touch input device event for "tap anywhere" to show slider overlay
+    lv_indev_t* indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+            lv_indev_add_event_cb(indev, [](lv_event_t* e) {
+                LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+                if (display->HandleTouchWake()) {
+                    return;  // Touch only dismissed the ambient screen
+                }
+                if (display->slider_overlay_ && lv_obj_has_flag(display->slider_overlay_, LV_OBJ_FLAG_HIDDEN)) {
+                    display->ShowSliderOverlay();
+                }
+            }, LV_EVENT_PRESSED, this);
+            break;
+        }
+        indev = lv_indev_get_next(indev);
+    }
 }
 #if CONFIG_IDF_TARGET_ESP32P4
 #define  MAX_MESSAGES 40
@@ -835,16 +972,20 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -8);
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
-    lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+    // Empty at boot — Application::Initialize() immediately shows the wifi.gif
+    // emotion; the old FONT_AWESOME_MICROCHIP_AI chip glyph is not wanted.
+    lv_label_set_text(emoji_label_, "");
 
     emoji_image_ = lv_img_create(emoji_box_);
     lv_obj_center(emoji_image_);
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+
+    CreateStateRing(screen);
 
     /* Middle layer: preview_image_ - centered display */
     preview_image_ = lv_image_create(screen);
@@ -924,35 +1065,27 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
-    /* Top layer: Bottom bar - fixed height at bottom */
+    /* Top layer: Bottom bar - chat text centered below emoji */
     bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(12));
-    lv_obj_set_style_radius(bottom_bar_, 0, 0);
+    lv_obj_set_size(bottom_bar_, LV_HOR_RES - lvgl_theme->spacing(8), LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(bottom_bar_, 8, 0);
     lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);
     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
-    lv_obj_set_style_pad_left(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(bottom_bar_, lvgl_theme->spacing(4), 0);
+    lv_obj_set_style_pad_all(bottom_bar_, lvgl_theme->spacing(4), 0);
     lv_obj_set_style_border_width(bottom_bar_, 0, 0);
     lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+    // Position below the emoji area (roughly 65% from top)
+    lv_obj_align(bottom_bar_, LV_ALIGN_CENTER, 0, LV_VER_RES / 4);
 
-    /* chat_message_label_ placed in bottom_bar_, single-line horizontal scroll */
+    /* chat_message_label_ centered below emoji, multi-line wrap */
     chat_message_label_ = lv_label_create(bottom_bar_);
     lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(16));
+    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
     lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
-
-    // Start scrolling after a delay (short text won't scroll)
-    static lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_delay(&a, 1000);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_obj_set_style_anim(chat_message_label_, &a, LV_PART_MAIN);
-    lv_obj_set_style_anim_duration(chat_message_label_, lv_anim_speed_clamped(60, 300, 60000), LV_PART_MAIN);
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -966,6 +1099,28 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+
+    // Create slider overlay for brightness and volume
+    CreateSliderOverlay();
+    InitializeAmbientScreen();
+
+    // Register touch input device event for "tap anywhere" to show slider overlay
+    lv_indev_t* indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+            lv_indev_add_event_cb(indev, [](lv_event_t* e) {
+                LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+                if (display->HandleTouchWake()) {
+                    return;  // Touch only dismissed the ambient screen
+                }
+                if (display->slider_overlay_ && lv_obj_has_flag(display->slider_overlay_, LV_OBJ_FLAG_HIDDEN)) {
+                    display->ShowSliderOverlay();
+                }
+            }, LV_EVENT_PRESSED, this);
+            break;
+        }
+        indev = lv_indev_get_next(indev);
+    }
 }
 
 void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -1256,4 +1411,582 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
             lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
     }
+}
+
+void LcdDisplay::CreateSliderOverlay() {
+    auto screen = lv_screen_active();
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    auto icon_font = lvgl_theme->icon_font()->font();
+
+    // Create auto-hide timer
+    esp_timer_create_args_t timer_args = {
+        .callback = [](void* arg) {
+            LcdDisplay* display = static_cast<LcdDisplay*>(arg);
+            display->HideSliderOverlay();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "slider_hide_timer",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&timer_args, &slider_hide_timer_);
+
+    // Full-screen overlay with semi-transparent dark background
+    slider_overlay_ = lv_obj_create(screen);
+    lv_obj_set_size(slider_overlay_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(slider_overlay_, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(slider_overlay_, LV_OPA_60, 0);
+    lv_obj_set_style_radius(slider_overlay_, 0, 0);
+    lv_obj_set_style_border_width(slider_overlay_, 0, 0);
+    lv_obj_set_style_pad_all(slider_overlay_, 0, 0);
+    lv_obj_set_scrollbar_mode(slider_overlay_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(slider_overlay_, LV_OBJ_FLAG_HIDDEN);
+
+    // ===================== LEFT ARC (Brightness) =====================
+    // Left half of circle: bottom (0%) → left → top (100%)
+    brightness_arc_ = lv_arc_create(slider_overlay_);
+    lv_obj_set_size(brightness_arc_, 280, 280);
+    lv_arc_set_rotation(brightness_arc_, 90);           // Start at 6 o'clock (bottom)
+    lv_arc_set_bg_angles(brightness_arc_, 0, 180);      // Bottom → left → top
+    lv_arc_set_range(brightness_arc_, 1, 100);           // Min 1 to avoid completely dark
+    lv_arc_set_value(brightness_arc_, 75);               // Default - will be updated on show
+    lv_obj_align(brightness_arc_, LV_ALIGN_CENTER, 0, 0);
+
+    // Arc styling - indicator (active portion)
+    lv_obj_set_style_arc_color(brightness_arc_, lv_color_hex(0xFFCC00), LV_PART_INDICATOR);  // Warm yellow
+    lv_obj_set_style_arc_width(brightness_arc_, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(brightness_arc_, true, LV_PART_INDICATOR);
+
+    // Arc styling - background (inactive portion)
+    lv_obj_set_style_arc_color(brightness_arc_, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(brightness_arc_, 14, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(brightness_arc_, true, LV_PART_MAIN);
+
+    // Knob styling
+    lv_obj_set_style_bg_color(brightness_arc_, lv_color_hex(0xFFCC00), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(brightness_arc_, 4, LV_PART_KNOB);
+
+    // Transparent background for arc container
+    lv_obj_set_style_bg_opa(brightness_arc_, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(brightness_arc_, 0, 0);
+    lv_obj_add_flag(brightness_arc_, LV_OBJ_FLAG_ADV_HITTEST);  // Only respond to touches near arc path
+
+    // Brightness icon (sun) - left-center
+    brightness_icon_ = lv_label_create(slider_overlay_);
+    lv_label_set_text(brightness_icon_, FONT_AWESOME_BRIGHTNESS);
+    lv_obj_set_style_text_font(brightness_icon_, icon_font, 0);
+    lv_obj_set_style_text_color(brightness_icon_, lv_color_hex(0xFFCC00), 0);
+    lv_obj_align(brightness_icon_, LV_ALIGN_LEFT_MID, 50, -10);
+
+    // Brightness percentage label
+    brightness_label_ = lv_label_create(slider_overlay_);
+    lv_label_set_text(brightness_label_, "75%");
+    lv_obj_set_style_text_color(brightness_label_, lv_color_white(), 0);
+    lv_obj_align(brightness_label_, LV_ALIGN_LEFT_MID, 50, 14);
+
+    // Brightness arc event handler
+    lv_obj_add_event_cb(brightness_arc_, [](lv_event_t* e) {
+        LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* arc = (lv_obj_t*)lv_event_get_current_target(e);
+        int val = lv_arc_get_value(arc);
+
+        // Update label
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%%", val);
+        lv_label_set_text(display->brightness_label_, buf);
+
+        // Apply brightness (permanent = true to persist in NVS)
+        auto& board = Board::GetInstance();
+        board.GetBacklight()->SetBrightness(val, true);
+
+        // Reset auto-hide timer
+        if (display->slider_hide_timer_) {
+            esp_timer_stop(display->slider_hide_timer_);
+            esp_timer_start_once(display->slider_hide_timer_, 3000000); // 3 seconds
+        }
+    }, LV_EVENT_VALUE_CHANGED, this);
+
+    // ===================== RIGHT ARC (Volume) =====================
+    // Right half of circle: top (0%) → right → bottom (100%)
+    volume_arc_ = lv_arc_create(slider_overlay_);
+    lv_obj_set_size(volume_arc_, 280, 280);
+    lv_arc_set_rotation(volume_arc_, 270);              // Start at 12 o'clock (top)
+    lv_arc_set_bg_angles(volume_arc_, 0, 180);          // Top → right → bottom
+    lv_arc_set_range(volume_arc_, 0, 100);
+    lv_arc_set_value(volume_arc_, 70);                    // Default - will be updated on show
+    lv_obj_align(volume_arc_, LV_ALIGN_CENTER, 0, 0);
+
+    // Arc styling - indicator (active portion)
+    lv_obj_set_style_arc_color(volume_arc_, lv_color_hex(0x00AAFF), LV_PART_INDICATOR);  // Blue
+    lv_obj_set_style_arc_width(volume_arc_, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(volume_arc_, true, LV_PART_INDICATOR);
+
+    // Arc styling - background (inactive portion)
+    lv_obj_set_style_arc_color(volume_arc_, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(volume_arc_, 14, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(volume_arc_, true, LV_PART_MAIN);
+
+    // Knob styling
+    lv_obj_set_style_bg_color(volume_arc_, lv_color_hex(0x00AAFF), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(volume_arc_, 4, LV_PART_KNOB);
+
+    // Transparent background for arc container
+    lv_obj_set_style_bg_opa(volume_arc_, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(volume_arc_, 0, 0);
+    lv_obj_add_flag(volume_arc_, LV_OBJ_FLAG_ADV_HITTEST);  // Only respond to touches near arc path
+
+    // Volume icon (speaker) - right-center
+    volume_icon_ = lv_label_create(slider_overlay_);
+    lv_label_set_text(volume_icon_, FONT_AWESOME_VOLUME_HIGH);
+    lv_obj_set_style_text_font(volume_icon_, icon_font, 0);
+    lv_obj_set_style_text_color(volume_icon_, lv_color_hex(0x00AAFF), 0);
+    lv_obj_align(volume_icon_, LV_ALIGN_RIGHT_MID, -50, -10);
+
+    // Volume percentage label
+    volume_label_ = lv_label_create(slider_overlay_);
+    lv_label_set_text(volume_label_, "70%");
+    lv_obj_set_style_text_color(volume_label_, lv_color_white(), 0);
+    lv_obj_align(volume_label_, LV_ALIGN_RIGHT_MID, -50, 14);
+
+    // Volume arc event handler
+    lv_obj_add_event_cb(volume_arc_, [](lv_event_t* e) {
+        LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* arc = (lv_obj_t*)lv_event_get_current_target(e);
+        int val = lv_arc_get_value(arc);
+
+        // Update label
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%%", val);
+        lv_label_set_text(display->volume_label_, buf);
+
+        // Update volume icon based on value
+        if (val == 0) {
+            lv_label_set_text(display->volume_icon_, FONT_AWESOME_VOLUME_XMARK);
+        } else if (val < 30) {
+            lv_label_set_text(display->volume_icon_, FONT_AWESOME_VOLUME_LOW);
+        } else if (val < 70) {
+            lv_label_set_text(display->volume_icon_, FONT_AWESOME_VOLUME);
+        } else {
+            lv_label_set_text(display->volume_icon_, FONT_AWESOME_VOLUME_HIGH);
+        }
+
+        // Apply volume
+        auto& board = Board::GetInstance();
+        board.GetAudioCodec()->SetOutputVolume(val);
+
+        // Reset auto-hide timer
+        if (display->slider_hide_timer_) {
+            esp_timer_stop(display->slider_hide_timer_);
+            esp_timer_start_once(display->slider_hide_timer_, 3000000); // 3 seconds
+        }
+    }, LV_EVENT_VALUE_CHANGED, this);
+
+    // ===================== Quick action buttons =====================
+    CreateQuickActionButtons();
+
+    // ===================== Overlay touch event =====================
+    // Tapping overlay background (not on arcs) hides the overlay
+    lv_obj_add_event_cb(slider_overlay_, [](lv_event_t* e) {
+        LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* target = (lv_obj_t*)lv_event_get_target(e);
+        // Only hide if clicking the overlay background itself, not the arc controls
+        if (target == display->slider_overlay_) {
+            display->HideSliderOverlay();
+        }
+    }, LV_EVENT_CLICKED, this);
+}
+
+void LcdDisplay::CreateQuickActionButtons() {
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    auto icon_font = lvgl_theme->icon_font()->font();
+
+    auto make_button = [&](const char* icon, const char* text, lv_color_t color,
+                           lv_obj_t** text_label_out) {
+        lv_obj_t* btn = lv_button_create(slider_overlay_);
+        lv_obj_set_size(btn, 92, 62);
+        lv_obj_set_style_radius(btn, 14, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1f2430), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 4, 0);
+        lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t* icon_label = lv_label_create(btn);
+        lv_obj_set_style_text_font(icon_label, icon_font, 0);
+        lv_obj_set_style_text_color(icon_label, color, 0);
+        lv_label_set_text(icon_label, icon);
+
+        lv_obj_t* text_label = lv_label_create(btn);
+        lv_obj_set_style_text_color(text_label, lv_color_hex(0xd1d5db), 0);
+        lv_label_set_text(text_label, text);
+        if (text_label_out != nullptr) {
+            *text_label_out = text_label;
+        }
+        return btn;
+    };
+    (void)make_button; // only used by the logout button (device-binding builds)
+
+    // Reconnect WiFi — circular button with a wifi icon, dead-center on screen.
+    wifi_btn_ = lv_button_create(slider_overlay_);
+    lv_obj_set_size(wifi_btn_, 76, 76);
+    lv_obj_set_style_radius(wifi_btn_, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(wifi_btn_, lv_color_hex(0x1f2430), 0);
+    lv_obj_set_style_bg_opa(wifi_btn_, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(wifi_btn_, 0, 0);
+    lv_obj_set_style_pad_all(wifi_btn_, 0, 0);
+    lv_obj_align(wifi_btn_, LV_ALIGN_CENTER, 0, 0);
+    {
+        lv_obj_t* wifi_icon = lv_label_create(wifi_btn_);
+        lv_obj_set_style_text_font(wifi_icon, icon_font, 0);
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x22d3ee), 0);
+        lv_label_set_text(wifi_icon, FONT_AWESOME_WIFI);
+        lv_obj_center(wifi_icon);
+    }
+    lv_obj_add_event_cb(wifi_btn_, [](lv_event_t* e) {
+        LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+        display->HideSliderOverlay();
+        display->ShowNotification("Menyambung ulang WiFi...");
+        auto& wifi_manager = WifiManager::GetInstance();
+        wifi_manager.StopStation();
+        wifi_manager.StartStation();
+    }, LV_EVENT_CLICKED, this);
+
+#if defined(CONFIG_USE_AVAGENC_DEVICE_BINDING) || defined(CONFIG_USE_AVAGENC_USER_PAIRING)
+    // Logout: forget the avagenc user/binding and reboot into pairing.
+    // Two-tap confirm so a stray touch can't log the account out.
+    logout_btn_ = make_button(FONT_AWESOME_POWER_OFF, "Logout", lv_color_hex(0xf87171),
+                              &logout_btn_label_);
+    lv_obj_align(logout_btn_, LV_ALIGN_BOTTOM_MID, 0, -34);
+    lv_obj_add_event_cb(logout_btn_, [](lv_event_t* e) {
+        LcdDisplay* display = static_cast<LcdDisplay*>(lv_event_get_user_data(e));
+        int64_t now = esp_timer_get_time();
+        if (display->logout_armed_at_us_ != 0 &&
+            now - display->logout_armed_at_us_ < 3000000) {
+#ifdef CONFIG_USE_AVAGENC_DEVICE_BINDING
+            DeviceBinding().ClearBinding();
+#endif
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+            UserPairing().ClearUser();
+#endif
+            esp_restart();
+        }
+        display->logout_armed_at_us_ = now;
+        lv_label_set_text(display->logout_btn_label_, "Yakin?");
+        // Keep the overlay up long enough to confirm
+        if (display->slider_hide_timer_) {
+            esp_timer_stop(display->slider_hide_timer_);
+            esp_timer_start_once(display->slider_hide_timer_, 3000000);
+        }
+    }, LV_EVENT_CLICKED, this);
+#endif
+}
+
+void LcdDisplay::ShowSliderOverlay() {
+    DisplayLockGuard lock(this);
+    if (slider_overlay_ == nullptr) return;
+
+    // Cancel any ongoing fade-out animation and reset opacity
+    lv_anim_delete(slider_overlay_, NULL);
+    lv_obj_set_style_opa(slider_overlay_, LV_OPA_COVER, 0);
+
+    // Read current brightness and volume values
+    auto& board = Board::GetInstance();
+    int brightness = board.GetBacklight()->brightness();
+    int volume = board.GetAudioCodec()->output_volume();
+
+    // Update arcs with current values
+    lv_arc_set_value(brightness_arc_, brightness);
+    lv_arc_set_value(volume_arc_, volume);
+
+    // Update labels
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", brightness);
+    lv_label_set_text(brightness_label_, buf);
+
+    snprintf(buf, sizeof(buf), "%d%%", volume);
+    lv_label_set_text(volume_label_, buf);
+
+    // Update volume icon
+    if (volume == 0) {
+        lv_label_set_text(volume_icon_, FONT_AWESOME_VOLUME_XMARK);
+    } else if (volume < 30) {
+        lv_label_set_text(volume_icon_, FONT_AWESOME_VOLUME_LOW);
+    } else if (volume < 70) {
+        lv_label_set_text(volume_icon_, FONT_AWESOME_VOLUME);
+    } else {
+        lv_label_set_text(volume_icon_, FONT_AWESOME_VOLUME_HIGH);
+    }
+
+    // Reset the logout two-tap confirm state
+    logout_armed_at_us_ = 0;
+    if (logout_btn_label_ != nullptr) {
+        lv_label_set_text(logout_btn_label_, "Logout");
+    }
+
+    // Show overlay
+    lv_obj_remove_flag(slider_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(slider_overlay_);
+
+    // Start auto-hide timer (3 seconds)
+    if (slider_hide_timer_) {
+        esp_timer_stop(slider_hide_timer_);
+        esp_timer_start_once(slider_hide_timer_, 3000000);
+    }
+}
+
+void LcdDisplay::HideSliderOverlay() {
+    DisplayLockGuard lock(this);
+    if (slider_overlay_ == nullptr) return;
+    if (lv_obj_has_flag(slider_overlay_, LV_OBJ_FLAG_HIDDEN)) return;
+
+    if (slider_hide_timer_) {
+        esp_timer_stop(slider_hide_timer_);
+    }
+
+    // Fade out animation (500ms)
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, slider_overlay_);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&a, 500);
+    lv_anim_set_exec_cb(&a, [](void* obj, int32_t val) {
+        lv_obj_set_style_opa((lv_obj_t*)obj, val, 0);
+    });
+    lv_anim_set_completed_cb(&a, [](lv_anim_t* anim) {
+        lv_obj_add_flag((lv_obj_t*)anim->var, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa((lv_obj_t*)anim->var, LV_OPA_COVER, 0);  // Reset for next show
+    });
+    lv_anim_start(&a);
+}
+
+// ============ State ring (listening/speaking feedback) ============
+
+void LcdDisplay::CreateStateRing(lv_obj_t* screen) {
+    state_ring_ = lv_arc_create(screen);
+    // Slightly larger than the 128 px emoji, same center offset as emoji_box_
+    lv_obj_set_size(state_ring_, 176, 176);
+    lv_obj_align(state_ring_, LV_ALIGN_CENTER, 0, -8);
+    lv_arc_set_rotation(state_ring_, 270);
+    lv_arc_set_bg_angles(state_ring_, 0, 360);
+    lv_obj_remove_style(state_ring_, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(state_ring_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(state_ring_, 4, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(state_ring_, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(state_ring_, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(state_ring_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(state_ring_, 0, 0);
+    lv_obj_add_flag(state_ring_, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Ring geometry. The emoji GIF is 128 px, centred with the same -8 px offset.
+static constexpr int kConnectingRingSize = 232;  // loading spinner: wide, so it
+                                                  // doesn't hug the GIF
+static constexpr int kPulseStartSize     = 150;   // pulse begins just outside the emoji
+static constexpr int kPulseEndSize       = 312;   // ...and ripples out near the panel edge
+static constexpr int kRingOffsetY        = -8;
+
+void LcdDisplay::UpdateStateRing(DeviceState state, DeviceState previous) {
+    if (state_ring_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    lv_anim_delete(state_ring_, nullptr);
+    lv_obj_set_style_opa(state_ring_, LV_OPA_COVER, 0);
+
+    switch (state) {
+        case kDeviceStateConnecting: {
+            // Loading spinner while the audio channel / websocket opens.
+            // Wide radius so the ring floats clear of the emoji GIF.
+            lv_obj_set_size(state_ring_, kConnectingRingSize, kConnectingRingSize);
+            lv_obj_align(state_ring_, LV_ALIGN_CENTER, 0, kRingOffsetY);
+            lv_arc_set_angles(state_ring_, 0, 60);
+            lv_obj_set_style_arc_color(state_ring_, lv_color_hex(0x6b7280), LV_PART_INDICATOR);
+            lv_obj_remove_flag(state_ring_, LV_OBJ_FLAG_HIDDEN);
+
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, state_ring_);
+            lv_anim_set_values(&a, 0, 360);
+            lv_anim_set_duration(&a, 1000);
+            lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) {
+                lv_arc_set_rotation(static_cast<lv_obj_t*>(obj), 270 + v);
+            });
+            lv_anim_start(&a);
+            break;
+        }
+        case kDeviceStateListening:
+        case kDeviceStateSpeaking: {
+            // Once the call is running we keep the emoji clean — no ring.
+            // Only when we *enter* a call state from a non-call state (i.e. the
+            // moment the connection is established) do we play a one-shot pulse:
+            // a full ring that expands outward and fades away. Toggling between
+            // Listening and Speaking during the call does not re-trigger it.
+            bool was_in_call = (previous == kDeviceStateListening ||
+                                previous == kDeviceStateSpeaking);
+            if (was_in_call) {
+                lv_obj_add_flag(state_ring_, LV_OBJ_FLAG_HIDDEN);
+                break;
+            }
+
+            lv_obj_set_size(state_ring_, kPulseStartSize, kPulseStartSize);
+            lv_obj_align(state_ring_, LV_ALIGN_CENTER, 0, kRingOffsetY);
+            lv_arc_set_angles(state_ring_, 0, 360);
+            lv_obj_set_style_arc_color(state_ring_, lv_color_hex(0x22d3ee), LV_PART_INDICATOR);
+            lv_obj_remove_flag(state_ring_, LV_OBJ_FLAG_HIDDEN);
+
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, state_ring_);
+            lv_anim_set_values(&a, 0, 100);
+            lv_anim_set_duration(&a, 650);
+            lv_anim_set_repeat_count(&a, 2);  // two ripples, then hide
+            lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) {
+                lv_obj_t* ring = static_cast<lv_obj_t*>(obj);
+                int size = kPulseStartSize + (kPulseEndSize - kPulseStartSize) * v / 100;
+                lv_obj_set_size(ring, size, size);
+                lv_obj_align(ring, LV_ALIGN_CENTER, 0, kRingOffsetY);
+                lv_obj_set_style_opa(ring, LV_OPA_COVER - (LV_OPA_COVER * v / 100), 0);
+            });
+            lv_anim_set_ready_cb(&a, [](lv_anim_t* anim) {
+                lv_obj_add_flag(static_cast<lv_obj_t*>(anim->var), LV_OBJ_FLAG_HIDDEN);
+            });
+            lv_anim_start(&a);
+            break;
+        }
+        default:
+            lv_obj_add_flag(state_ring_, LV_OBJ_FLAG_HIDDEN);
+            break;
+    }
+}
+
+// ============ Ambient ("watch face") mode ============
+
+// Quiet hours: [start, end) wrapping midnight, e.g. 22..6
+static bool IsNightTime() {
+    Settings settings("night", false);
+    if (!settings.GetBool("enabled", true)) {
+        return false;
+    }
+    time_t now = time(NULL);
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    if (tm_local.tm_year < 2025 - 1900) {
+        return false;  // Clock not synced yet
+    }
+    int start = settings.GetInt("start", 22);
+    int end = settings.GetInt("end", 6);
+    int hour = tm_local.tm_hour;
+    return start <= end ? (hour >= start && hour < end)
+                        : (hour >= start || hour < end);
+}
+
+void LcdDisplay::InitializeAmbientScreen() {
+    if (ambient_timeout_ms_ <= 0 || ambient_screen_ != nullptr) {
+        return;
+    }
+    // Called from SetupUI, which already holds the display lock
+    ambient_screen_ = std::make_unique<AmbientScreen>(
+        lv_screen_active(), static_cast<LvglTheme*>(current_theme_));
+    ambient_screen_->SetOnWake([this]() {
+        HideAmbientScreen();
+    });
+    ambient_screen_->SetOnMinuteTick([this]() {
+        // Re-evaluate night-mode dimming while the face stays up
+        ApplyAmbientBrightness();
+    });
+    ResetAmbientTimer();
+}
+
+void LcdDisplay::ResetAmbientTimer() {
+    if (ambient_timer_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(ambient_timer_);
+    if (device_state_ == kDeviceStateIdle) {
+        esp_timer_start_once(ambient_timer_, (uint64_t)ambient_timeout_ms_ * 1000);
+    }
+}
+
+void LcdDisplay::ApplyAmbientBrightness() {
+    auto backlight = Board::GetInstance().GetBacklight();
+    if (backlight == nullptr) {
+        return;
+    }
+    // Base on the user's saved brightness, not the current (possibly already
+    // dimmed) level
+    Settings settings("display", false);
+    int user_brightness = settings.GetInt("brightness", 75);
+    uint8_t dimmed = IsNightTime()
+        ? 4
+        : std::max<uint8_t>(user_brightness * 30 / 100, 4);
+    backlight->SetBrightness(dimmed);
+}
+
+void LcdDisplay::ShowAmbientScreen() {
+    if (ambient_screen_ == nullptr || device_state_ != kDeviceStateIdle) {
+        return;
+    }
+    {
+        DisplayLockGuard lock(this);
+        if (ambient_screen_->IsVisible()) {
+            return;
+        }
+        HideSliderOverlay();
+        ambient_screen_->Show();
+    }
+    ApplyAmbientBrightness();
+}
+
+void LcdDisplay::HideAmbientScreen() {
+    if (ambient_screen_ == nullptr) {
+        return;
+    }
+    {
+        DisplayLockGuard lock(this);
+        if (!ambient_screen_->IsVisible()) {
+            ResetAmbientTimer();
+            return;
+        }
+        ambient_screen_->Hide();
+    }
+    auto backlight = Board::GetInstance().GetBacklight();
+    if (backlight != nullptr) {
+        backlight->RestoreBrightness();
+    }
+    ResetAmbientTimer();
+}
+
+bool LcdDisplay::HandleTouchWake() {
+    // While the ambient screen is up, presses are handled by its own tap
+    // (wake) and swipe (face switch) callbacks — just keep the slider overlay
+    // from opening. Otherwise a touch simply postpones ambient mode.
+    if (ambient_screen_ != nullptr && ambient_screen_->IsVisible()) {
+        return true;
+    }
+    ResetAmbientTimer();
+    return false;
+}
+
+void LcdDisplay::SetWeather(const char* icon_utf8, const char* text) {
+    if (ambient_screen_ == nullptr) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    ambient_screen_->SetWeather(icon_utf8 ? icon_utf8 : "", text ? text : "");
+}
+
+void LcdDisplay::OnStateChanged(DeviceState state) {
+    DeviceState previous = device_state_;
+    device_state_ = state;
+    if (state == kDeviceStateIdle) {
+        ResetAmbientTimer();
+    } else {
+        HideAmbientScreen();
+        if (ambient_timer_ != nullptr) {
+            esp_timer_stop(ambient_timer_);
+        }
+    }
+    UpdateStateRing(state, previous);
 }

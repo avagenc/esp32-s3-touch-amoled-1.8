@@ -44,6 +44,34 @@ std::string SystemInfo::GetMacAddress() {
     return std::string(mac_str);
 }
 
+std::string SystemInfo::GetDeviceCode() {
+    uint8_t mac[6];
+#if CONFIG_IDF_TARGET_ESP32P4
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+#else
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+#endif
+    // Crockford base32 alphabet (no I, L, O, U to avoid ambiguity when typed).
+    static const char kAlphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    // Pack the 48-bit MAC, then emit 10 symbols of 5 bits each (MSB first).
+    uint64_t value = 0;
+    for (int i = 0; i < 6; i++) {
+        value = (value << 8) | mac[i];
+    }
+    value <<= 2;  // 48 bits -> 50 bits so it splits evenly into 10 groups of 5
+
+    char code[11];
+    for (int i = 0; i < 10; i++) {
+        int shift = (9 - i) * 5;
+        code[i] = kAlphabet[(value >> shift) & 0x1F];
+    }
+    code[10] = '\0';
+
+    std::string s(code);
+    return "AVA-" + s.substr(0, 5) + "-" + s.substr(5, 5);
+}
+
 std::string SystemInfo::GetChipModelName() {
     return std::string(CONFIG_IDF_TARGET);
 }

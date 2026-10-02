@@ -706,19 +706,29 @@ def get_text_font_path(builtin_text_font, xiaozhi_fonts_path):
         return None
 
 
-def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path, project_root=None):
+def get_emoji_collection_path(default_emoji_collection, xiaozhi_fonts_path, project_root=None, project_emoji_root=None):
     """
     Get the emoji collection path if needed
     Returns the emoji directory path or None if no emoji collection is needed
-    
-    Supports:
+
+    Resolution order:
+    - Project-local override: <project_emoji_root>/<collection> (e.g.
+      main/assets/emoji/avagenc_128). This is git-tracked and survives
+      `idf.py fullclean` / component-manager re-resolution, unlike managed_components.
     - PNG emoji collections from xiaozhi-fonts (e.g., emojis_32, twemoji_64)
     - GIF emoji collections from xiaozhi-fonts (e.g., noto-emoji_128, noto-emoji_64)
     - Otto GIF emoji collection (otto-gif)
     """
     if not default_emoji_collection:
         return None
-    
+
+    # Project-local emoji collection takes priority (safe from fullclean / re-download).
+    if project_emoji_root:
+        local_path = os.path.join(project_emoji_root, default_emoji_collection)
+        if os.path.isdir(local_path):
+            print(f"Using project-local emoji collection: {local_path}")
+            return local_path
+
     # Special handling for otto-gif collection
     if default_emoji_collection == 'otto-gif':
         if project_root:
@@ -816,6 +826,7 @@ def main():
     parser.add_argument('--output', required=True, help='Output path for assets.bin')
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
     parser.add_argument('--xiaozhi_fonts_path', help='Path to xiaozhi-fonts component directory')
+    parser.add_argument('--project_emoji_root', help='Project-local directory holding emoji collection subfolders (takes priority over xiaozhi-fonts)')
     parser.add_argument('--extra_files', help='Path to extra files directory to be included in assets')
     
     args = parser.parse_args()
@@ -880,7 +891,7 @@ def main():
     # Calculate project root from script location for otto-gif support
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    emoji_collection_path = get_emoji_collection_path(args.emoji_collection, args.xiaozhi_fonts_path, project_root)
+    emoji_collection_path = get_emoji_collection_path(args.emoji_collection, args.xiaozhi_fonts_path, project_root, args.project_emoji_root)
     
     # Get extra files path if provided
     extra_files_path = args.extra_files

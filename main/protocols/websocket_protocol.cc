@@ -84,10 +84,21 @@ bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
-    int version = settings.GetInt("version");
-    if (version != 0) {
-        version_ = version;
+
+    // Prefer the avagenc device-binding token if present; the backend resolves
+    // the user_id from it (see DeviceBinding / CONFIG_USE_AVAGENC_DEVICE_BINDING).
+    std::string device_token = Settings("avagenc", false).GetString("device_token");
+    if (!device_token.empty()) {
+        token = device_token;
     }
+
+    // Hardcode fallback: Go bridge server (when NVS is empty / fresh flash)
+    if (url.empty()) {
+        url = "ws://16.176.46.21:8081/ws";
+    }
+
+    // Force Protocol v1 (raw Opus, no binary header) to match Go bridge server
+    version_ = 1;
 
     error_occurred_ = false;
 
@@ -108,6 +119,13 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+
+    // Local pairing stores the paired user_id on-device (no backend yet). Send it
+    // so the bridge can attach the session to that user. See user_pairing.cc.
+    std::string user_id = Settings("avagenc", false).GetString("user_id");
+    if (!user_id.empty()) {
+        websocket_->SetHeader("X-User-Id", user_id.c_str());
+    }
 
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {

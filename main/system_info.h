@@ -12,6 +12,9 @@ public:
     static size_t GetMinimumFreeHeapSize();
     static size_t GetFreeHeapSize();
     static std::string GetMacAddress();
+    // Human-friendly, stable device code derived from the WiFi MAC (eFuse),
+    // e.g. "AVA-7F3K9-Q2A5C". Used for the device<->user pairing UI.
+    static std::string GetDeviceCode();
     static std::string GetChipModelName();
     static std::string GetUserAgent();
     static esp_err_t PrintTaskCpuUsage(TickType_t xTicksToWait);

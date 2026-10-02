@@ -4,6 +4,8 @@
 #include "application.h"
 #include "system_info.h"
 #include "settings.h"
+#include "clock_sync.h"
+#include "weather_service.h"
 #include "assets/lang_config.h"
 
 #include <freertos/FreeRTOS.h>
@@ -115,6 +117,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
 #endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+            // Keep the wall clock accurate for the ambient watch face
+            ClockSync::GetInstance().Start();
+            WeatherService::GetInstance().Start();
             break;
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");
@@ -132,6 +137,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+            GetDisplay()->HideQrCode();  // remove the provisioning QR (no-op if none)
+#endif
             // Try to connect with the new credentials
             TryWifiConnect();
             break;
@@ -167,13 +175,41 @@ void WifiBoard::StartWifiConfigMode() {
     wifi_manager.StartConfigAp();
 
     // Show config prompt after a short delay
-    Application::GetInstance().Schedule([&wifi_manager]() {
+    Application::GetInstance().Schedule([this, &wifi_manager]() {
         std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
         hint += wifi_manager.GetApSsid();
         hint += Lang::Strings::ACCESS_VIA_BROWSER;
         hint += wifi_manager.GetApWebUrl();
 
         Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
+
+#ifdef CONFIG_USE_AVAGENC_USER_PAIRING
+        // Combined first-time setup: show a QR the avagenc app scans to auto-join
+        // this (open) AP and push WiFi credentials + user_id in one POST to
+        // /submit. See provisioning.md. The AP is open, so no key is needed to
+        // join — the app just needs the SSID from the QR.
+        std::string ap_ssid = wifi_manager.GetApSsid();
+        std::string submit_url = wifi_manager.GetApWebUrl();
+        while (!submit_url.empty() && submit_url.back() == '/') {
+            submit_url.pop_back();
+        }
+        submit_url += "/submit";
+
+        cJSON* o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "v", 1);
+        cJSON_AddStringToObject(o, "type", "avagenc_provision");
+        cJSON_AddStringToObject(o, "device_id", SystemInfo::GetMacAddress().c_str());
+        cJSON_AddStringToObject(o, "device_code", SystemInfo::GetDeviceCode().c_str());
+        cJSON_AddStringToObject(o, "ap_ssid", ap_ssid.c_str());
+        cJSON_AddStringToObject(o, "submit_url", submit_url.c_str());
+        char* s = cJSON_PrintUnformatted(o);
+        std::string payload(s ? s : "{}");
+        cJSON_free(s);
+        cJSON_Delete(o);
+
+        GetDisplay()->ShowQrCode(payload, ap_ssid,
+                                 "Pindai dengan aplikasi avagenc untuk setup WiFi & login");
+#endif
     });
 #elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
     auto &blufi = Blufi::GetInstance();

@@ -35,6 +35,8 @@
 #include "wake_words/esp_wake_word.h"
 #endif
 
+#include "wake_words/ei_wake_word.h"
+
 #define TAG "AudioService"
 
 AudioService::AudioService() {
@@ -120,6 +122,15 @@ void AudioService::Initialize(AudioCodec* codec) {
         .skip_unhandled_events = true,
     };
     esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
+
+    // Default to EiWakeWord (Edge Impulse) - will be overridden by SetModelsList if ESP-SR models are found
+    wake_word_ = std::make_unique<EiWakeWord>();
+    wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
+        if (callbacks_.on_wake_word_detected) {
+            callbacks_.on_wake_word_detected(wake_word);
+        }
+    });
+    ESP_LOGI(TAG, "Default wake word set to EiWakeWord (Edge Impulse)");
 }
 
 void AudioService::Start() {
@@ -265,18 +276,27 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        /* Feed the wake word and/or audio processor */
-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
-            int samples = 160; // 10ms
+        /* Feed the wake word */
+        if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
             std::vector<int16_t> data;
-            if (ReadAudioData(data, 16000, samples)) {
-                if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
+            int samples = wake_word_->GetFeedSize();
+            if (samples > 0) {
+                if (ReadAudioData(data, 16000, samples)) {
                     wake_word_->Feed(data);
+                    continue;
                 }
-                if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+            }
+        }
+
+        /* Feed the audio processor */
+        if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+            std::vector<int16_t> data;
+            int samples = audio_processor_->GetFeedSize();
+            if (samples > 0) {
+                if (ReadAudioData(data, 16000, samples)) {
                     audio_processor_->Feed(std::move(data));
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -616,6 +636,11 @@ void AudioService::EnableAudioTesting(bool enable) {
     }
 }
 
+bool AudioService::IsPlaybackActive() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return !audio_playback_queue_.empty() || !audio_decode_queue_.empty();
+}
+
 void AudioService::EnableDeviceAec(bool enable) {
     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
     if (!audio_processor_initialized_) {
@@ -703,13 +728,17 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
     } else if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
         wake_word_ = std::make_unique<AfeWakeWord>();
     } else {
-        wake_word_ = nullptr;
+        // Fallback to Edge Impulse wake word
+        ESP_LOGI(TAG, "No ESP-SR models found, using Edge Impulse wake word");
+        wake_word_ = std::make_unique<EiWakeWord>();
     }
 #else
     if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
         wake_word_ = std::make_unique<EspWakeWord>();
     } else {
-        wake_word_ = nullptr;
+        // Fallback to Edge Impulse wake word
+        ESP_LOGI(TAG, "No ESP-SR models found, using Edge Impulse wake word");
+        wake_word_ = std::make_unique<EiWakeWord>();
     }
 #endif
 

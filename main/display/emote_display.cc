@@ -1,3 +1,10 @@
+#include <sdkconfig.h>
+
+// Only the emote display path uses this backend. Compiling it always would
+// pull esp_emote_gfx into the link, whose bundled qrcodegen collides with
+// LVGL's qrcodegen (used by the pairing QR overlay).
+#ifdef CONFIG_USE_EMOTE_MESSAGE_STYLE
+
 #include "emote_display.h"
 
 // Standard C++ headers
@@ -248,3 +255,5 @@ void EmoteDisplay::RefreshAll()
 }
 
 } // namespace emote
+
+#endif // CONFIG_USE_EMOTE_MESSAGE_STYLE

@@ -34,34 +34,25 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         models = models_list;
     }
 
-    char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
-    char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
-    
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
-    afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
+
+    // NS MUST stay off on this board: there is no esp-sr "model" partition (wake
+    // word runs on Edge Impulse instead), so afe_init_aec_ns dereferences NULL and
+    // the device crash-loops (Guru Meditation in afe_create_from_config). Noise
+    // suppression is done on the bridge instead (high-pass + adaptive gate in Go).
+    afe_config->ns_init = false;
+    // VAD off — server has its own RMS-based VAD (SilenceThreshold = 150)
+    afe_config->vad_init = false;
     afe_config->vad_mode = VAD_MODE_0;
-    afe_config->vad_min_noise_ms = 100;
-    if (vad_model_name != nullptr) {
-        afe_config->vad_model_name = vad_model_name;
-    }
 
-    if (ns_model_name != nullptr) {
-        afe_config->ns_init = true;
-        afe_config->ns_model_name = ns_model_name;
-        afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    } else {
-        afe_config->ns_init = false;
-    }
-
-    afe_config->agc_init = false;
+    afe_config->agc_init = true;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC
     afe_config->aec_init = true;
-    afe_config->vad_init = false;
+    afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
 #else
     afe_config->aec_init = false;
-    afe_config->vad_init = true;
 #endif
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);

@@ -36,8 +36,8 @@
  * 
  */
 
-#define OPUS_FRAME_DURATION_MS 60
-#define MAX_ENCODE_TASKS_IN_QUEUE 2
+#define OPUS_FRAME_DURATION_MS 20
+#define MAX_ENCODE_TASKS_IN_QUEUE 8
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
@@ -71,7 +71,7 @@
         .application_mode   = ESP_OPUS_ENC_APPLICATION_AUDIO,                                                     \
         .complexity         = 0,                                                                                  \
         .enable_fec         = false,                                                                              \
-        .enable_dtx         = true,                                                                               \
+        .enable_dtx         = false,                                                                              \
         .enable_vbr         = true,                                                                               \
     }
 
@@ -119,6 +119,7 @@ public:
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
     bool IsAfeWakeWord();
+    bool IsPlaybackActive();
 
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
